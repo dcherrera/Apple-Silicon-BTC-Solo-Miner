@@ -28,6 +28,23 @@ fi
 echo "Installing Python dependencies..."
 pip3 install --user rumps requests pyobjc-framework-Metal
 
+# Install Bitcoin Core for block submission
+echo ""
+echo "Installing Bitcoin Core (for block submission)..."
+if command -v brew &> /dev/null; then
+    if ! command -v bitcoin-cli &> /dev/null; then
+        brew install bitcoin
+        echo "Bitcoin Core installed (~57 MB)"
+    else
+        echo "Bitcoin Core already installed"
+    fi
+else
+    echo "Warning: Homebrew not found. Install Bitcoin Core manually for block submission:"
+    echo "  brew install bitcoin"
+    echo ""
+    echo "Without it, you'll need to submit blocks manually if you find one."
+fi
+
 echo ""
 echo "Installation complete!"
 echo ""

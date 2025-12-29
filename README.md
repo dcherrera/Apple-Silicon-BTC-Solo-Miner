@@ -85,6 +85,19 @@ The miner automatically detects power status:
 - `miner_menubar.py` - macOS menu bar app
 - `~/.btc_miner/` - Config, stats, logs
 
+## Block Submission
+
+If you find a block, the miner will automatically try to submit it. For the best chance of success, run Bitcoin Core in the background:
+
+```bash
+# Start Bitcoin daemon (doesn't need to sync - just connects to peers)
+bitcoind -daemon -connect=0 -listen=1
+
+# The miner will use bitcoin-cli to submit your block
+```
+
+The installer sets up Bitcoin Core (~57 MB). You do **not** need to sync the full 600GB blockchain - just having `bitcoind` running gives you peer connections to broadcast your block.
+
 ## Realistic Expectations
 
 At 100 MH/s vs the Bitcoin network's ~700 EH/s, your odds of finding a block are approximately:
