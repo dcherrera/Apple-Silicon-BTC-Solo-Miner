@@ -16,6 +16,7 @@ import signal
 import subprocess
 import threading
 import time
+import plistlib
 from pathlib import Path
 from datetime import datetime
 
@@ -33,6 +34,11 @@ LOG_FILE = CONFIG_DIR / 'miner.log'
 WINS_FILE = CONFIG_DIR / 'wins.json'
 
 MINER_SCRIPT = Path(__file__).parent / 'btc_miner.py'
+MENUBAR_SCRIPT = Path(__file__).resolve()
+
+# Launch Agent paths
+LAUNCH_AGENTS_DIR = Path.home() / 'Library' / 'LaunchAgents'
+LAUNCH_AGENT_PLIST = LAUNCH_AGENTS_DIR / 'com.btcminer.menubar.plist'
 
 
 def format_hashrate(h: float) -> str:
@@ -96,6 +102,13 @@ class BitcoinMinerApp(rumps.App):
         self.uptime_item = rumps.MenuItem("Uptime: --")
         self.wallet_item = rumps.MenuItem("Wallet: --")
 
+        # Launch at login toggle
+        self.launch_at_login_item = rumps.MenuItem(
+            "Launch at Login",
+            callback=self.toggle_launch_at_login
+        )
+        self.launch_at_login_item.state = self.is_launch_at_login_enabled()
+
         self.menu = [
             self.status_item,
             self.gpu_item,
@@ -113,6 +126,7 @@ class BitcoinMinerApp(rumps.App):
             rumps.MenuItem("Start Mining", callback=self.start_mining),
             rumps.MenuItem("Stop Mining", callback=self.stop_mining),
             None,  # Separator
+            self.launch_at_login_item,
             rumps.MenuItem("View Logs", callback=self.view_logs),
             rumps.MenuItem("Open Folder", callback=self.open_folder),
             None,  # Separator
@@ -397,6 +411,65 @@ class BitcoinMinerApp(rumps.App):
         """Save config to file."""
         CONFIG_DIR.mkdir(exist_ok=True)
         CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+    def is_launch_at_login_enabled(self) -> bool:
+        """Check if launch at login is enabled."""
+        return LAUNCH_AGENT_PLIST.exists()
+
+    def toggle_launch_at_login(self, sender):
+        """Toggle launch at login setting."""
+        if self.is_launch_at_login_enabled():
+            self.disable_launch_at_login()
+            sender.state = False
+            rumps.notification(
+                title="Bitcoin Miner",
+                subtitle="Launch at Login Disabled",
+                message="The miner will no longer start automatically."
+            )
+        else:
+            self.enable_launch_at_login()
+            sender.state = True
+            rumps.notification(
+                title="Bitcoin Miner",
+                subtitle="Launch at Login Enabled",
+                message="The miner will start automatically when you log in."
+            )
+
+    def enable_launch_at_login(self):
+        """Create launch agent to start at login."""
+        LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Create plist for launch agent
+        plist = {
+            'Label': 'com.btcminer.menubar',
+            'ProgramArguments': [
+                '/usr/bin/python3',
+                str(MENUBAR_SCRIPT),
+            ],
+            'RunAtLoad': True,
+            'KeepAlive': False,
+            'WorkingDirectory': str(MENUBAR_SCRIPT.parent),
+        }
+
+        with open(LAUNCH_AGENT_PLIST, 'wb') as f:
+            plistlib.dump(plist, f)
+
+        # Load the launch agent
+        subprocess.run(
+            ['launchctl', 'load', str(LAUNCH_AGENT_PLIST)],
+            capture_output=True
+        )
+
+    def disable_launch_at_login(self):
+        """Remove launch agent."""
+        if LAUNCH_AGENT_PLIST.exists():
+            # Unload the launch agent
+            subprocess.run(
+                ['launchctl', 'unload', str(LAUNCH_AGENT_PLIST)],
+                capture_output=True
+            )
+            # Remove the plist file
+            LAUNCH_AGENT_PLIST.unlink()
 
     def show_donate(self, _):
         """Show donation address."""
