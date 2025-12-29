@@ -252,9 +252,61 @@ class PublicAPI:
         resp = requests.get(f'{self.base_url}/block/{block_hash}', timeout=10)
         return resp.json()
 
+    def get_mempool_transactions(self, limit: int = 100) -> list:
+        """Get high-fee transactions from mempool."""
+        try:
+            # Get mempool transaction IDs sorted by fee rate
+            resp = requests.get(f'{self.base_url}/mempool/txids', timeout=15)
+            txids = resp.json()[:limit]  # Top transactions by fee
+
+            transactions = []
+            total_fees = 0
+            total_weight = 0
+            max_weight = 3992000  # Leave room for coinbase (~8000 weight units)
+
+            for txid in txids:
+                try:
+                    # Get transaction details
+                    tx_resp = requests.get(f'{self.base_url}/tx/{txid}', timeout=5)
+                    tx_data = tx_resp.json()
+
+                    # Get raw transaction hex
+                    raw_resp = requests.get(f'{self.base_url}/tx/{txid}/hex', timeout=5)
+                    tx_hex = raw_resp.text
+
+                    weight = tx_data.get('weight', 0)
+                    fee = tx_data.get('fee', 0)
+
+                    # Check if adding this tx would exceed block weight limit
+                    if total_weight + weight > max_weight:
+                        break
+
+                    transactions.append({
+                        'txid': txid,
+                        'hex': tx_hex,
+                        'weight': weight,
+                        'fee': fee,
+                        'wtxid': tx_data.get('wtxid', txid),
+                    })
+
+                    total_fees += fee
+                    total_weight += weight
+
+                except Exception:
+                    continue  # Skip problematic transactions
+
+            return transactions, total_fees
+
+        except Exception as e:
+            logging.warning(f"Failed to get mempool transactions: {e}")
+            return [], 0
+
     def get_block_template(self) -> dict:
-        """Create a block template from public API."""
+        """Create a block template from public API with mempool transactions."""
         block = self.get_latest_block()
+
+        # Fetch mempool transactions for fees
+        transactions, total_fees = self.get_mempool_transactions(limit=50)
 
         return {
             'height': block['height'] + 1,
@@ -263,7 +315,49 @@ class PublicAPI:
             'version': 0x20000000,
             'curtime': int(time.time()),
             'difficulty': block['difficulty'],
+            'transactions': transactions,
+            'total_fees': total_fees,
         }
+
+# ============================================================================
+# MERKLE TREE FUNCTIONS
+# ============================================================================
+
+def calculate_merkle_root(txids: list) -> bytes:
+    """Calculate merkle root from list of txids (as bytes, little-endian)."""
+    if not txids:
+        return b'\x00' * 32
+
+    # Work with a copy
+    level = list(txids)
+
+    while len(level) > 1:
+        # If odd number, duplicate last element
+        if len(level) % 2 == 1:
+            level.append(level[-1])
+
+        next_level = []
+        for i in range(0, len(level), 2):
+            combined = level[i] + level[i + 1]
+            next_level.append(hashlib.sha256(hashlib.sha256(combined).digest()).digest())
+
+        level = next_level
+
+    return level[0]
+
+
+def calculate_witness_commitment(wtxids: list, witness_reserved: bytes = None) -> bytes:
+    """Calculate witness commitment for SegWit blocks.
+    wtxids[0] should be 0x00...00 for coinbase."""
+    if witness_reserved is None:
+        witness_reserved = b'\x00' * 32
+
+    # Witness root is merkle root of wtxids (with coinbase wtxid = 0)
+    witness_root = calculate_merkle_root(wtxids)
+
+    # Witness commitment = SHA256(SHA256(witness_root || witness_reserved))
+    return hashlib.sha256(hashlib.sha256(witness_root + witness_reserved).digest()).digest()
+
 
 # ============================================================================
 # COINBASE TRANSACTION BUILDER
@@ -275,10 +369,7 @@ class CoinbaseBuilder:
     # Current block reward (after 4th halving, April 2024)
     BLOCK_REWARD = 312500000  # 3.125 BTC in satoshis
 
-    # Witness commitment for blocks with only coinbase (no other SegWit txs)
-    # This is sha256(sha256(witness_root || witness_reserved_value))
-    # For coinbase-only blocks: witness_root = 0x00...00 (32 bytes)
-    # witness_reserved_value = 0x00...00 (32 bytes, stored in coinbase witness)
+    # Witness commitment header (BIP141)
     WITNESS_COMMITMENT_HEADER = bytes.fromhex('aa21a9ed')  # Required prefix
 
     @staticmethod
@@ -331,7 +422,8 @@ class CoinbaseBuilder:
 
     @staticmethod
     def create_coinbase_tx(height: int, wallet_address: str = None,
-                           extra_nonce: bytes = b'', witness_commitment: bytes = None) -> bytes:
+                           extra_nonce: bytes = b'', witness_commitment: bytes = None,
+                           total_fees: int = 0) -> bytes:
         """Create a coinbase transaction with SegWit witness commitment (BIP141)."""
 
         # Block height in script (BIP34)
@@ -357,6 +449,9 @@ class CoinbaseBuilder:
                 hashlib.sha256(witness_root + witness_reserved).digest()
             ).digest()
 
+        # Total reward = block subsidy + fees
+        total_reward = CoinbaseBuilder.BLOCK_REWARD + total_fees
+
         # Build transaction (SegWit format)
         tx = b''
         tx += struct.pack('<I', 1)  # Version
@@ -370,8 +465,8 @@ class CoinbaseBuilder:
         # Outputs (2 outputs: reward + witness commitment)
         tx += b'\x02'  # Output count
 
-        # Output 1: Block reward to wallet
-        tx += struct.pack('<Q', CoinbaseBuilder.BLOCK_REWARD)
+        # Output 1: Block reward + fees to wallet
+        tx += struct.pack('<Q', total_reward)
         if wallet_address:
             output_script = CoinbaseBuilder.address_to_script(wallet_address)
         else:
@@ -579,13 +674,45 @@ class MinerEngine:
         bits = template['bits']
         target = bits_to_target(bits)
 
-        # Create coinbase
+        # Get transactions from template
+        transactions = template.get('transactions', [])
+        total_fees = template.get('total_fees', 0)
+
+        # Build list of txids and wtxids for merkle calculations
+        txids = []  # For block merkle root
+        wtxids = [b'\x00' * 32]  # Coinbase wtxid is always 0x00...00
+
+        # Collect raw transaction data for block serialization
+        tx_data = []
+
+        for tx in transactions:
+            # txid (little-endian bytes)
+            txid = bytes.fromhex(tx['txid'])[::-1]
+            txids.append(txid)
+
+            # wtxid for witness commitment
+            wtxid = bytes.fromhex(tx.get('wtxid', tx['txid']))[::-1]
+            wtxids.append(wtxid)
+
+            # Raw transaction hex
+            tx_data.append(bytes.fromhex(tx['hex']))
+
+        # Calculate witness commitment from all wtxids
+        witness_commitment = calculate_witness_commitment(wtxids)
+
+        # Create coinbase with fees included and correct witness commitment
         coinbase = CoinbaseBuilder.create_coinbase_tx(
             height,
-            self.config.get('wallet_address')
+            self.config.get('wallet_address'),
+            extra_nonce=b'',
+            witness_commitment=witness_commitment,
+            total_fees=total_fees
         )
         coinbase_txid = CoinbaseBuilder.get_txid(coinbase)
-        merkle_root = coinbase_txid
+
+        # Merkle root from coinbase + all transaction txids
+        all_txids = [coinbase_txid] + txids
+        merkle_root = calculate_merkle_root(all_txids)
 
         # Serialize header
         header_bytes = struct.pack(
@@ -598,7 +725,13 @@ class MinerEngine:
             0  # nonce placeholder
         )
 
-        self.logger.info(f"Mining block {height} (GPU)")
+        # Store transaction data for block assembly when we find a winner
+        self._current_coinbase = coinbase
+        self._current_tx_data = tx_data
+
+        tx_count = len(transactions)
+        fee_btc = total_fees / 100000000
+        self.logger.info(f"Mining block {height} (GPU) - {tx_count} txs, +{fee_btc:.4f} BTC fees")
         self.logger.debug(f"Target: {target:064x}"[:40] + "...")
 
         block_start = time.time()
@@ -724,13 +857,41 @@ class MinerEngine:
         bits = template['bits']
         target = bits_to_target(bits)
 
-        # Create coinbase
+        # Get transactions from template
+        transactions = template.get('transactions', [])
+        total_fees = template.get('total_fees', 0)
+
+        # Build list of txids and wtxids for merkle calculations
+        txids = []
+        wtxids = [b'\x00' * 32]  # Coinbase wtxid is always 0x00...00
+        tx_data = []
+
+        for tx in transactions:
+            txid = bytes.fromhex(tx['txid'])[::-1]
+            txids.append(txid)
+            wtxid = bytes.fromhex(tx.get('wtxid', tx['txid']))[::-1]
+            wtxids.append(wtxid)
+            tx_data.append(bytes.fromhex(tx['hex']))
+
+        # Calculate witness commitment
+        witness_commitment = calculate_witness_commitment(wtxids)
+
+        # Create coinbase with fees
         coinbase = CoinbaseBuilder.create_coinbase_tx(
             height,
-            self.config.get('wallet_address')
+            self.config.get('wallet_address'),
+            witness_commitment=witness_commitment,
+            total_fees=total_fees
         )
         coinbase_txid = CoinbaseBuilder.get_txid(coinbase)
-        merkle_root = coinbase_txid  # Only coinbase tx
+
+        # Merkle root from coinbase + all transaction txids
+        all_txids = [coinbase_txid] + txids
+        merkle_root = calculate_merkle_root(all_txids)
+
+        # Store transaction data for block assembly
+        self._current_coinbase = coinbase
+        self._current_tx_data = tx_data
 
         header = BlockHeader(
             version=template.get('version', 0x20000000),
@@ -741,7 +902,9 @@ class MinerEngine:
             nonce=0
         )
 
-        self.logger.info(f"Mining block {height} (CPU)")
+        tx_count = len(transactions)
+        fee_btc = total_fees / 100000000
+        self.logger.info(f"Mining block {height} (CPU) - {tx_count} txs, +{fee_btc:.4f} BTC fees")
         self.logger.debug(f"Target: {target:064x}"[:40] + "...")
 
         # Shared counter for hash count
@@ -846,9 +1009,30 @@ class MinerEngine:
         # Build full block hex for submission
         block_hex = None
         if coinbase_tx:
-            # Block = header + varint(tx_count) + coinbase_tx
-            # For solo mining with just coinbase, tx_count = 1
-            block_hex = result['header'].hex() + '01' + coinbase_tx.hex()
+            # Get transaction data stored during mining
+            tx_data = getattr(self, '_current_tx_data', [])
+
+            # Block = header + varint(tx_count) + coinbase_tx + all_transactions
+            tx_count = 1 + len(tx_data)  # coinbase + other transactions
+
+            # Encode transaction count as varint
+            if tx_count < 0xfd:
+                tx_count_bytes = bytes([tx_count])
+            elif tx_count <= 0xffff:
+                tx_count_bytes = b'\xfd' + struct.pack('<H', tx_count)
+            elif tx_count <= 0xffffffff:
+                tx_count_bytes = b'\xfe' + struct.pack('<I', tx_count)
+            else:
+                tx_count_bytes = b'\xff' + struct.pack('<Q', tx_count)
+
+            # Assemble full block
+            block_bytes = result['header'] + tx_count_bytes + coinbase_tx
+            for tx in tx_data:
+                block_bytes += tx
+
+            block_hex = block_bytes.hex()
+
+            self.logger.info(f"Block assembled: {len(block_bytes)} bytes, {tx_count} transactions")
 
         win_data = {
             'timestamp': datetime.now().isoformat(),
