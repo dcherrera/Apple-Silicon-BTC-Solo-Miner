@@ -411,6 +411,7 @@ class MinerEngine:
         self.stats = {
             'start_time': None,
             'total_hashes': 0,
+            'session_hashes': 0,
             'blocks_checked': 0,
             'current_height': 0,
             'hashrate': 0,
@@ -539,6 +540,8 @@ class MinerEngine:
         self.logger.info(f"Power mode: {power_mode} (batch: {batch_size:,}, sleep: {sleep_time*1000:.0f}ms)")
         self.stats['power_mode'] = power_mode
 
+        last_hashes_counted = 0  # Track hashes for delta calculation
+
         while self.running and base_nonce < 2**32:
             # Check power status every 30 seconds
             if time.time() - last_power_check >= 30:
@@ -596,8 +599,13 @@ class MinerEngine:
                 hashes = base_nonce
                 hashrate = hashes / elapsed if elapsed > 0 else 0
 
+                # Calculate delta since last update
+                hashes_delta = base_nonce - last_hashes_counted
+                last_hashes_counted = base_nonce
+
                 with self.lock:
-                    self.stats['total_hashes'] += batch_size
+                    self.stats['total_hashes'] += hashes_delta
+                    self.stats['session_hashes'] += hashes_delta
                     self.stats['hashrate'] = hashrate
                     self.stats['last_update'] = datetime.now().isoformat()
 
@@ -707,6 +715,7 @@ class MinerEngine:
 
                 with self.lock:
                     self.stats['total_hashes'] += hashes
+                    self.stats['session_hashes'] += hashes
                     self.stats['hashrate'] = hashrate
                     self.stats['last_update'] = datetime.now().isoformat()
 

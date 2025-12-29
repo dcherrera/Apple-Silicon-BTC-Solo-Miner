@@ -89,6 +89,8 @@ class BitcoinMinerApp(rumps.App):
         self.status_item = rumps.MenuItem("Status: Checking...")
         self.gpu_item = rumps.MenuItem("GPU: --")
         self.hashrate_item = rumps.MenuItem("Hashrate: --")
+        self.session_avg_item = rumps.MenuItem("Session Avg: --")
+        self.alltime_avg_item = rumps.MenuItem("All Time Avg: --")
         self.block_item = rumps.MenuItem("Block: --")
         self.hashes_item = rumps.MenuItem("Hashes: --")
         self.uptime_item = rumps.MenuItem("Uptime: --")
@@ -99,6 +101,8 @@ class BitcoinMinerApp(rumps.App):
             self.gpu_item,
             None,  # Separator
             self.hashrate_item,
+            self.session_avg_item,
+            self.alltime_avg_item,
             self.block_item,
             self.hashes_item,
             self.uptime_item,
@@ -184,6 +188,13 @@ class BitcoinMinerApp(rumps.App):
 
             self.status_item.title = f"Status: Running {'(GPU)' if gpu_enabled else '(CPU)'} [{power_mode}]"
             self.hashrate_item.title = f"Hashrate: {format_hashrate(hashrate)}"
+
+            # Show total hashes for session and all-time
+            session_hashes = stats.get('session_hashes', 0)
+            total_hashes = stats.get('total_hashes', 0)
+            self.session_avg_item.title = f"Session: {format_number(session_hashes)} hashes"
+            self.alltime_avg_item.title = f"All Time: {format_number(total_hashes)} hashes"
+
             self.block_item.title = f"Block: {stats.get('current_height', '--')}"
             self.hashes_item.title = f"Hashes: {format_number(stats.get('total_hashes', 0))}"
 
@@ -203,6 +214,8 @@ class BitcoinMinerApp(rumps.App):
             self.title = "₿ Off"
             self.status_item.title = "Status: Stopped"
             self.hashrate_item.title = "Hashrate: --"
+            self.session_avg_item.title = "Session Avg: --"
+            self.alltime_avg_item.title = "All Time Avg: --"
             self.block_item.title = "Block: --"
             self.hashes_item.title = f"Total Hashes: {format_number(stats.get('total_hashes', 0))}"
             self.uptime_item.title = "Uptime: --"
