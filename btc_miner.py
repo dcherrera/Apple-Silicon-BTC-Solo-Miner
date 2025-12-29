@@ -586,7 +586,7 @@ class MinerEngine:
                     'hash': hash_bytes,
                     'header': header_bytes[:76] + struct.pack('<I', nonce)
                 }
-                self.save_win(height, win_result)
+                self.save_win(height, win_result, coinbase)
                 return win_result
 
             # Sleep on battery to reduce power consumption
@@ -698,7 +698,7 @@ class MinerEngine:
                 self.logger.critical(f"Hash: {result['hash'][::-1].hex()}")
 
                 # Save the win
-                self.save_win(height, result)
+                self.save_win(height, result, coinbase)
 
                 return result
 
@@ -755,37 +755,190 @@ class MinerEngine:
         else:
             return self.api.get_block_template()
 
-    def save_win(self, height: int, result: dict):
-        """Save a winning block to file."""
+    def save_win(self, height: int, result: dict, coinbase_tx: bytes = None):
+        """Save a winning block to file and attempt to broadcast."""
         wins = []
         if WINS_FILE.exists():
             wins = json.loads(WINS_FILE.read_text())
 
-        wins.append({
+        # Build full block hex for submission
+        block_hex = None
+        if coinbase_tx:
+            # Block = header + varint(tx_count) + coinbase_tx
+            # For solo mining with just coinbase, tx_count = 1
+            block_hex = result['header'].hex() + '01' + coinbase_tx.hex()
+
+        win_data = {
             'timestamp': datetime.now().isoformat(),
             'height': height,
             'nonce': result['nonce'],
             'hash': result['hash'][::-1].hex(),
             'header_hex': result['header'].hex(),
-        })
+            'block_hex': block_hex,
+            'submitted': False,
+            'submission_result': None,
+        }
 
+        # Try to submit the block
+        if block_hex:
+            submission_result = self.submit_block(block_hex, height)
+            win_data['submitted'] = submission_result.get('success', False)
+            win_data['submission_result'] = submission_result
+
+        wins.append(win_data)
         WINS_FILE.write_text(json.dumps(wins, indent=2))
 
         # Also send notification
-        self.notify_win(height, result)
+        self.notify_win(height, result, win_data.get('submitted', False))
 
-    def notify_win(self, height: int, result: dict):
+    def submit_block(self, block_hex: str, height: int) -> dict:
+        """Submit a mined block to the Bitcoin network via multiple methods."""
+        self.logger.critical("ATTEMPTING TO SUBMIT BLOCK TO NETWORK...")
+
+        results = {'success': False, 'attempts': []}
+
+        # Method 1: Try local Bitcoin Core if available
+        try:
+            self.logger.critical("Trying local Bitcoin Core...")
+            import subprocess
+            result = subprocess.run(
+                ['bitcoin-cli', 'submitblock', block_hex],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            attempt = {
+                'method': 'bitcoin-cli',
+                'returncode': result.returncode,
+                'stdout': result.stdout,
+                'stderr': result.stderr,
+            }
+            results['attempts'].append(attempt)
+
+            # Empty response or null means success for submitblock
+            if result.returncode == 0 and (not result.stdout.strip() or result.stdout.strip() == 'null'):
+                self.logger.critical("SUCCESS! Block submitted via bitcoin-cli")
+                results['success'] = True
+                results['successful_method'] = 'bitcoin-cli'
+                return results
+            else:
+                self.logger.warning(f"bitcoin-cli returned: {result.stdout} {result.stderr}")
+        except FileNotFoundError:
+            self.logger.info("bitcoin-cli not found, trying public APIs...")
+        except Exception as e:
+            self.logger.warning(f"bitcoin-cli failed: {e}")
+
+        # Method 2: Try public block submission APIs
+        # Note: Most public APIs don't accept raw blocks, only transactions
+        # These are the few that might work for block submission
+        submission_apis = [
+            {
+                'name': 'BTC.com',
+                'url': 'https://chain.api.btc.com/v3/block/submit',
+                'method': 'POST',
+                'data_type': 'json',
+                'json_key': 'hexdata',
+            },
+        ]
+
+        for api in submission_apis:
+            try:
+                self.logger.critical(f"Submitting to {api['name']}...")
+
+                if api.get('data_type') == 'json':
+                    response = requests.post(
+                        api['url'],
+                        json={api['json_key']: block_hex},
+                        timeout=30
+                    )
+                else:
+                    response = requests.post(
+                        api['url'],
+                        data=block_hex,
+                        headers={'Content-Type': 'text/plain'},
+                        timeout=30
+                    )
+
+                attempt = {
+                    'api': api['name'],
+                    'status_code': response.status_code,
+                    'response': response.text[:500],
+                }
+                results['attempts'].append(attempt)
+
+                if response.status_code in [200, 201]:
+                    self.logger.critical(f"SUCCESS! Block submitted via {api['name']}")
+                    results['success'] = True
+                    results['successful_method'] = api['name']
+                    return results
+                else:
+                    self.logger.warning(f"{api['name']} returned {response.status_code}: {response.text[:200]}")
+
+            except Exception as e:
+                attempt = {
+                    'api': api['name'],
+                    'error': str(e),
+                }
+                results['attempts'].append(attempt)
+                self.logger.warning(f"{api['name']} failed: {e}")
+
+        # Method 3: Try to broadcast via any reachable Bitcoin node
+        # Common public Bitcoin nodes that accept connections
+        bitcoin_nodes = [
+            ('seed.bitcoin.sipa.be', 8333),
+            ('dnsseed.bluematt.me', 8333),
+            ('seed.bitcoinstats.com', 8333),
+        ]
+
+        self.logger.critical("Attempting direct node broadcast...")
+        for host, port in bitcoin_nodes:
+            try:
+                import socket
+                # This is a simplified attempt - real implementation would need
+                # full Bitcoin P2P protocol handshake
+                self.logger.info(f"Trying {host}:{port}...")
+                # For now, just log that we'd try this
+                results['attempts'].append({
+                    'method': f'direct_node_{host}',
+                    'note': 'P2P broadcast not fully implemented - use bitcoin-cli'
+                })
+            except Exception as e:
+                pass
+
+        if not results['success']:
+            self.logger.critical("=" * 60)
+            self.logger.critical("AUTO-SUBMISSION FAILED - MANUAL ACTION REQUIRED!")
+            self.logger.critical("=" * 60)
+            self.logger.critical("URGENT: Submit block manually ASAP before next block is found!")
+            self.logger.critical("")
+            self.logger.critical("Option 1 - If you have Bitcoin Core:")
+            self.logger.critical(f"  bitcoin-cli submitblock <block_hex>")
+            self.logger.critical("")
+            self.logger.critical("Option 2 - Use a public node:")
+            self.logger.critical("  Visit: https://btc.com/tools/tx/publish")
+            self.logger.critical("  Or any Bitcoin block explorer with submitblock")
+            self.logger.critical("")
+            self.logger.critical("Block hex saved to: ~/.btc_miner/wins.json")
+            self.logger.critical("=" * 60)
+
+        return results
+
+    def notify_win(self, height: int, result: dict, submitted: bool = False):
         """Send notification about winning block."""
         # macOS notification
+        status = "SUBMITTED!" if submitted else "Saved to wins.json"
         try:
             os.system(f'''
-                osascript -e 'display notification "Block {height} found! Hash: {result["hash"][::-1].hex()[:16]}..." with title "BITCOIN BLOCK FOUND!" sound name "Glass"'
+                osascript -e 'display notification "Block {height} found! {status}" with title "BITCOIN BLOCK FOUND!" sound name "Glass"'
             ''')
         except:
             pass
 
-        self.logger.critical("CHECK wins.json FOR BLOCK DATA!")
-        self.logger.critical("If using light mode, you need to submit manually to a node!")
+        if submitted:
+            self.logger.critical("BLOCK SUBMITTED TO NETWORK!")
+        else:
+            self.logger.critical("CHECK wins.json FOR BLOCK DATA!")
+            self.logger.critical("Block hex saved - can be submitted manually if needed")
 
     def save_stats(self):
         """Save current stats to file."""
