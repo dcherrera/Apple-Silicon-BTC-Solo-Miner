@@ -275,10 +275,64 @@ class CoinbaseBuilder:
     # Current block reward (after 4th halving, April 2024)
     BLOCK_REWARD = 312500000  # 3.125 BTC in satoshis
 
+    # Witness commitment for blocks with only coinbase (no other SegWit txs)
+    # This is sha256(sha256(witness_root || witness_reserved_value))
+    # For coinbase-only blocks: witness_root = 0x00...00 (32 bytes)
+    # witness_reserved_value = 0x00...00 (32 bytes, stored in coinbase witness)
+    WITNESS_COMMITMENT_HEADER = bytes.fromhex('aa21a9ed')  # Required prefix
+
+    @staticmethod
+    def get_txid(coinbase_tx: bytes) -> bytes:
+        """Get the txid (without witness) from a SegWit coinbase transaction.
+        The txid is used for merkle root calculation.
+        For SegWit txs, we need to strip the marker, flag, and witness data."""
+        # Check if this is a SegWit transaction (marker = 0x00, flag = 0x01)
+        if len(coinbase_tx) > 6 and coinbase_tx[4] == 0x00 and coinbase_tx[5] == 0x01:
+            # SegWit transaction - need to reconstruct without witness
+            version = coinbase_tx[:4]
+
+            # Skip marker and flag, find inputs
+            pos = 6  # After version + marker + flag
+            input_count = coinbase_tx[pos]
+            pos += 1
+
+            # Read input (for coinbase, there's always 1 input)
+            input_data = coinbase_tx[pos:pos + 32 + 4 + 1]  # prevout txid + vout
+            pos += 32 + 4  # Skip prevout
+            script_len = coinbase_tx[pos]
+            pos += 1
+            input_data += bytes([script_len]) + coinbase_tx[pos:pos + script_len]
+            pos += script_len
+            input_data += coinbase_tx[pos:pos + 4]  # sequence
+            pos += 4
+
+            # Read outputs
+            output_count = coinbase_tx[pos]
+            pos += 1
+            outputs_start = pos
+
+            for _ in range(output_count):
+                pos += 8  # value
+                script_len = coinbase_tx[pos]
+                pos += 1 + script_len
+
+            outputs_data = coinbase_tx[outputs_start - 1:pos]
+
+            # Skip witness data, get locktime (last 4 bytes)
+            locktime = coinbase_tx[-4:]
+
+            # Reconstruct transaction without witness
+            tx_no_witness = version + bytes([input_count]) + input_data + outputs_data + locktime
+
+            return hashlib.sha256(hashlib.sha256(tx_no_witness).digest()).digest()
+        else:
+            # Non-SegWit transaction
+            return hashlib.sha256(hashlib.sha256(coinbase_tx).digest()).digest()
+
     @staticmethod
     def create_coinbase_tx(height: int, wallet_address: str = None,
-                           extra_nonce: bytes = b'') -> bytes:
-        """Create a coinbase transaction."""
+                           extra_nonce: bytes = b'', witness_commitment: bytes = None) -> bytes:
+        """Create a coinbase transaction with SegWit witness commitment (BIP141)."""
 
         # Block height in script (BIP34)
         height_bytes = height.to_bytes((height.bit_length() + 7) // 8, 'little')
@@ -291,27 +345,55 @@ class CoinbaseBuilder:
             b'/SoloMiner/'
         )
 
-        # Build transaction
+        # For SegWit blocks, coinbase needs a witness with reserved value
+        # The witness stack has exactly one element: the witness reserved value (32 zero bytes)
+        witness_reserved = b'\x00' * 32
+
+        # Calculate witness commitment if not provided
+        # For blocks with only coinbase tx: witness_root = 0x00...00
+        if witness_commitment is None:
+            witness_root = b'\x00' * 32
+            witness_commitment = hashlib.sha256(
+                hashlib.sha256(witness_root + witness_reserved).digest()
+            ).digest()
+
+        # Build transaction (SegWit format)
         tx = b''
         tx += struct.pack('<I', 1)  # Version
+        tx += b'\x00\x01'  # SegWit marker and flag
         tx += b'\x01'  # Input count
         tx += b'\x00' * 32  # Null txid (coinbase)
         tx += b'\xff\xff\xff\xff'  # Null vout
         tx += bytes([len(coinbase_script)]) + coinbase_script
         tx += b'\xff\xff\xff\xff'  # Sequence
 
-        # Output
-        tx += b'\x01'  # Output count
-        tx += struct.pack('<Q', CoinbaseBuilder.BLOCK_REWARD)
+        # Outputs (2 outputs: reward + witness commitment)
+        tx += b'\x02'  # Output count
 
+        # Output 1: Block reward to wallet
+        tx += struct.pack('<Q', CoinbaseBuilder.BLOCK_REWARD)
         if wallet_address:
-            # Create proper output script for address
             output_script = CoinbaseBuilder.address_to_script(wallet_address)
         else:
-            # OP_RETURN (unspendable - you'll lose the reward!)
-            output_script = b'\x6a'  # OP_RETURN
-
+            output_script = b'\x6a'  # OP_RETURN (unspendable)
         tx += bytes([len(output_script)]) + output_script
+
+        # Output 2: Witness commitment (OP_RETURN)
+        # Format: OP_RETURN OP_PUSHBYTES_36 <commitment_header><commitment_hash>
+        tx += struct.pack('<Q', 0)  # 0 satoshis
+        commitment_script = (
+            b'\x6a' +  # OP_RETURN
+            b'\x24' +  # OP_PUSHBYTES_36 (36 = 4 + 32)
+            CoinbaseBuilder.WITNESS_COMMITMENT_HEADER +
+            witness_commitment
+        )
+        tx += bytes([len(commitment_script)]) + commitment_script
+
+        # Witness data for coinbase input (required for SegWit)
+        tx += b'\x01'  # Number of witness stack items
+        tx += b'\x20'  # Length of witness reserved value (32 bytes)
+        tx += witness_reserved
+
         tx += struct.pack('<I', 0)  # Locktime
 
         return tx
@@ -502,7 +584,7 @@ class MinerEngine:
             height,
             self.config.get('wallet_address')
         )
-        coinbase_txid = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
+        coinbase_txid = CoinbaseBuilder.get_txid(coinbase)
         merkle_root = coinbase_txid
 
         # Serialize header
@@ -647,7 +729,7 @@ class MinerEngine:
             height,
             self.config.get('wallet_address')
         )
-        coinbase_txid = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
+        coinbase_txid = CoinbaseBuilder.get_txid(coinbase)
         merkle_root = coinbase_txid  # Only coinbase tx
 
         header = BlockHeader(
