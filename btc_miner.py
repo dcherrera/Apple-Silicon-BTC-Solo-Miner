@@ -42,9 +42,10 @@ import requests
 
 # Try to import GPU miner
 try:
-    from gpu_miner import MetalSHA256Miner, METAL_AVAILABLE
+    from gpu_miner import MetalSHA256Miner, METAL_AVAILABLE, GPUError
 except ImportError:
     METAL_AVAILABLE = False
+    GPUError = Exception  # Fallback if gpu_miner not available
 
 # ============================================================================
 # CONFIGURATION
@@ -775,13 +776,24 @@ class MinerEngine:
                     self.stats['power_mode'] = power_mode
                 last_power_check = time.time()
 
-            # Mine a batch
-            result = self.gpu_miner.mine(
-                header_bytes,
-                bits,
-                max_nonce=base_nonce + batch_size,
-                batch_size=batch_size
-            )
+            # Mine a batch - handle GPU errors from power state changes
+            try:
+                result = self.gpu_miner.mine(
+                    header_bytes,
+                    bits,
+                    max_nonce=base_nonce + batch_size,
+                    batch_size=batch_size
+                )
+            except GPUError as e:
+                self.logger.warning(f"GPU error detected: {e}")
+                self.logger.info("Reinitializing GPU after power state change...")
+                try:
+                    self.gpu_miner.reinitialize()
+                    self.logger.info("GPU reinitialized successfully, resuming mining")
+                    continue  # Retry with the same base_nonce
+                except Exception as reinit_error:
+                    self.logger.error(f"GPU reinitialization failed: {reinit_error}")
+                    raise  # Re-raise to trigger retry at higher level
 
             # Reset the header base nonce for next iteration
             base_nonce += batch_size

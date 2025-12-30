@@ -24,6 +24,11 @@ except ImportError:
     METAL_AVAILABLE = False
 
 
+class GPUError(Exception):
+    """Raised when the GPU becomes unavailable or needs reinitialization."""
+    pass
+
+
 # SHA-256 in pure Python for verification
 def double_sha256(data: bytes) -> bytes:
     return hashlib.sha256(hashlib.sha256(data).digest()).digest()
@@ -246,6 +251,10 @@ kernel void mine(
         if not METAL_AVAILABLE:
             raise RuntimeError("Metal not available - install pyobjc-framework-Metal")
 
+        self._init_gpu()
+
+    def _init_gpu(self):
+        """Initialize or reinitialize the Metal GPU device and pipeline."""
         self.device = Metal.MTLCreateSystemDefaultDevice()
         if not self.device:
             raise RuntimeError("No Metal device found")
@@ -275,6 +284,12 @@ kernel void mine(
 
         self.hash_count = 0
 
+    def reinitialize(self):
+        """Reinitialize the GPU after a power state change or error."""
+        print("Reinitializing Metal GPU...")
+        self._init_gpu()
+        print("GPU reinitialized successfully")
+
     def mine(self, header_bytes: bytes, target_bits: int,
              max_nonce: int = 2**32, batch_size: int = 1024 * 1024) -> Optional[Tuple[int, bytes]]:
         """
@@ -298,11 +313,13 @@ kernel void mine(
         target = bits_to_target(target_bits)
         target_zeros = 256 - target.bit_length() if target > 0 else 256
 
-        # Create buffers
+        # Create buffers - check for GPU failures (can happen on power state changes)
         header_data = struct.pack('<20I', *header_uints)
         header_buffer = self.device.newBufferWithBytes_length_options_(
             header_data, 80, Metal.MTLResourceStorageModeShared
         )
+        if header_buffer is None:
+            raise GPUError("Failed to create header buffer - GPU may need reinitialization")
 
         result_nonce_buffer = self.device.newBufferWithLength_options_(
             4, Metal.MTLResourceStorageModeShared
@@ -310,10 +327,14 @@ kernel void mine(
         result_hash_buffer = self.device.newBufferWithLength_options_(
             32, Metal.MTLResourceStorageModeShared
         )
+        if result_nonce_buffer is None or result_hash_buffer is None:
+            raise GPUError("Failed to create result buffers - GPU may need reinitialization")
 
         target_buffer = self.device.newBufferWithBytes_length_options_(
             struct.pack('<I', target_zeros), 4, Metal.MTLResourceStorageModeShared
         )
+        if target_buffer is None:
+            raise GPUError("Failed to create target buffer - GPU may need reinitialization")
 
         base_nonce = 0
         self.hash_count = 0
@@ -323,11 +344,15 @@ kernel void mine(
             found_buffer = self.device.newBufferWithBytes_length_options_(
                 struct.pack('<I', 0), 4, Metal.MTLResourceStorageModeShared
             )
+            if found_buffer is None:
+                raise GPUError("Failed to create found buffer - GPU may need reinitialization")
 
             base_nonce_buffer = self.device.newBufferWithBytes_length_options_(
                 struct.pack('<I', base_nonce & 0xFFFFFFFF), 4,
                 Metal.MTLResourceStorageModeShared
             )
+            if base_nonce_buffer is None:
+                raise GPUError("Failed to create nonce buffer - GPU may need reinitialization")
 
             # Create command buffer
             cmd = self.command_queue.commandBuffer()
@@ -356,18 +381,16 @@ kernel void mine(
 
             self.hash_count += batch_size
 
-            # Check result
-            found_data = found_buffer.contents()
-            found = ord(found_data[0]) | (ord(found_data[1]) << 8) | \
-                    (ord(found_data[2]) << 16) | (ord(found_data[3]) << 24)
+            # Check result - use as_buffer() to read Metal buffer contents
+            found_data = found_buffer.contents().as_buffer(4)
+            found = struct.unpack('<I', found_data)[0]
 
             if found:
-                nonce_data = result_nonce_buffer.contents()
-                nonce = ord(nonce_data[0]) | (ord(nonce_data[1]) << 8) | \
-                        (ord(nonce_data[2]) << 16) | (ord(nonce_data[3]) << 24)
+                nonce_data = result_nonce_buffer.contents().as_buffer(4)
+                nonce = struct.unpack('<I', nonce_data)[0]
 
-                hash_data = result_hash_buffer.contents()
-                hash_bytes = b''.join(hash_data[i] for i in range(32))
+                hash_data = result_hash_buffer.contents().as_buffer(32)
+                hash_bytes = bytes(hash_data)
 
                 return (nonce, hash_bytes)
 
